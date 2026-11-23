@@ -15,6 +15,8 @@ All eight public functions are intentionally unimplemented and raise
 the signatures or the tests.
 """
 
+from collections.abc import Mapping
+
 IDENTIFIER_WHITELIST = frozenset(
     {
         "users",
@@ -38,6 +40,10 @@ PLACEHOLDER_STYLES = ("qmark", "numeric", "named")
 ORDER_DIRECTIONS = ("ASC", "DESC")
 
 
+def _is_int(value) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
 def placeholder(style: str, index: int) -> str:
     """Return the placeholder for ``style`` at zero-based ``index``.
 
@@ -52,7 +58,15 @@ def placeholder(style: str, index: int) -> str:
     styles, negative indexes and non-integer indexes raise ``ValueError``.
     Comparison is exact, tolerance 0.
     """
-    raise NotImplementedError
+    if style not in PLACEHOLDER_STYLES:
+        raise ValueError(f"unknown placeholder style: {style!r}")
+    if not _is_int(index) or index < 0:
+        raise ValueError(f"invalid placeholder index: {index!r}")
+    if style == "qmark":
+        return "?"
+    if style == "numeric":
+        return f":{index + 1}"
+    return f":p{index + 1}"
 
 
 def bind_values(values, style: str) -> tuple:
@@ -64,7 +78,11 @@ def bind_values(values, style: str) -> tuple:
     is rejected because it is a single value, not a collection of parameters.
     An empty iterable yields an empty tuple. Comparison is exact, tolerance 0.
     """
-    raise NotImplementedError
+    if style not in PLACEHOLDER_STYLES:
+        raise ValueError(f"unknown placeholder style: {style!r}")
+    if isinstance(values, (str, bytes)):
+        raise ValueError("a bare string is a single value, not parameters")
+    return tuple(values)
 
 
 def quote_identifier(name: str) -> str:
@@ -77,7 +95,9 @@ def quote_identifier(name: str) -> str:
     are outside the whitelist and must be rejected, so an unescaped internal
     backtick can never be emitted. Comparison is exact, tolerance 0.
     """
-    raise NotImplementedError
+    if not isinstance(name, str) or name not in IDENTIFIER_WHITELIST:
+        raise ValueError(f"identifier not whitelisted: {name!r}")
+    return f"`{name}`"
 
 
 def build_select(table: str, columns, where, order, limit) -> dict:
@@ -96,7 +116,38 @@ def build_select(table: str, columns, where, order, limit) -> dict:
     placeholders, has no trailing semicolon and contains no bound values.
     Invalid inputs raise ``ValueError``. Comparison is exact, tolerance 0.
     """
-    raise NotImplementedError
+    if not _is_int(limit) or not 1 <= limit <= MAX_ROWS:
+        raise ValueError(f"limit must be an integer from 1 to {MAX_ROWS}")
+
+    if isinstance(columns, (str, bytes)) or not columns:
+        raise ValueError("columns must be a non-empty sequence")
+    quoted_columns = [quote_identifier(column) for column in columns]
+
+    sql = f"SELECT {', '.join(quoted_columns)} FROM {quote_identifier(table)}"
+    params = []
+
+    if where is not None:
+        if not isinstance(where, Mapping):
+            raise ValueError("where must be a mapping of column to value")
+        conditions = []
+        for column, value in where.items():
+            conditions.append(f"{quote_identifier(column)} = ?")
+            params.append(value)
+        if conditions:
+            sql += " WHERE " + " AND ".join(conditions)
+
+    if order is not None:
+        if not isinstance(order, (tuple, list)) or len(order) != 2:
+            raise ValueError("order must be a (column, direction) pair")
+        order_column, direction = order
+        if direction not in ORDER_DIRECTIONS:
+            raise ValueError(f"invalid order direction: {direction!r}")
+        sql += f" ORDER BY {quote_identifier(order_column)} {direction}"
+
+    sql += " LIMIT ?"
+    params.append(limit)
+
+    return {"sql": sql, "params": tuple(params)}
 
 
 def build_insert(table: str, row) -> dict:
@@ -111,7 +162,16 @@ def build_insert(table: str, row) -> dict:
     Return ``{"sql": <statement>, "params": <tuple>}``. Comparison is exact,
     tolerance 0.
     """
-    raise NotImplementedError
+    if not isinstance(row, Mapping) or not row:
+        raise ValueError("row must be a non-empty mapping")
+
+    quoted_columns = [quote_identifier(column) for column in row]
+    marks = ", ".join("?" for _ in row)
+    sql = (
+        f"INSERT INTO {quote_identifier(table)} "
+        f"({', '.join(quoted_columns)}) VALUES ({marks})"
+    )
+    return {"sql": sql, "params": tuple(row.values())}
 
 
 def expand_in(values) -> tuple:
@@ -122,7 +182,12 @@ def expand_in(values) -> tuple:
     appear in the result. Empty input and a bare string raise ``ValueError``.
     Comparison is exact, tolerance 0.
     """
-    raise NotImplementedError
+    if isinstance(values, (str, bytes)):
+        raise ValueError("a bare string is a single value, not a collection")
+    items = tuple(values)
+    if not items:
+        raise ValueError("cannot expand an empty collection")
+    return tuple("?" for _ in items)
 
 
 def validate_policy(policy) -> list[str]:
@@ -139,7 +204,20 @@ def validate_policy(policy) -> list[str]:
     ``identifier_whitelist``, then ``row_limit``. A safe policy returns ``[]``.
     Missing keys are unsafe. Comparison is exact, tolerance 0.
     """
-    raise NotImplementedError
+    issues = []
+    if not isinstance(policy, Mapping):
+        return ["string_concat", "identifier_whitelist", "row_limit"]
+
+    if policy.get("allow_string_concat", True):
+        issues.append("string_concat")
+    if not policy.get("identifier_whitelist", False):
+        issues.append("identifier_whitelist")
+
+    max_rows = policy.get("max_rows")
+    if not _is_int(max_rows) or not 1 <= max_rows <= MAX_ROWS:
+        issues.append("row_limit")
+
+    return issues
 
 
 def query_batch(plans, policy) -> dict:
@@ -155,4 +233,19 @@ def query_batch(plans, policy) -> dict:
     ``{"plans": [plan, ...], "issues": []}``. An empty sequence returns an empty
     plans list. Comparison is exact, tolerance 0.
     """
-    raise NotImplementedError
+    issues = validate_policy(policy)
+    if issues:
+        raise ValueError(f"unsafe binding policy: {', '.join(issues)}")
+
+    built = []
+    for spec in plans:
+        plan = build_select(
+            spec["table"],
+            spec["columns"],
+            spec.get("where"),
+            spec.get("order"),
+            spec["limit"],
+        )
+        built.append(plan)
+
+    return {"plans": built, "issues": []}
